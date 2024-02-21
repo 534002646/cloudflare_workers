@@ -121,14 +121,13 @@ async function vlessOverWSHandler(request) {
 				vlessVersion = new Uint8Array([0, 0]),
 				isUDP,
 			} = processVlessHeader(chunk);
-			address = addressRemote;
-			portWithRandomLog = `${portRemote} ${isUDP ? 'udp' : 'tcp'} `;
 			if (hasError) {
-				// controller.error(message);
-				throw new Error(message); // cf seems has bug, controller.error will not end stream
-				// webSocket.close(1000, message);
+				// throw new Error(message); // cf seems has bug, controller.error will not end stream
+				webSocket.close(1000, message);
 				return;
 			}
+			address = addressRemote;
+			portWithRandomLog = `${portRemote} ${isUDP ? 'udp' : 'tcp'} `;
 
 			// If UDP and not DNS port, close it
 			if (isUDP && portRemote !== 53) {
@@ -251,7 +250,6 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
  * @returns {ReadableStream} A readable stream that can be used to read data from the WebSocket.
  */
 function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
-	let readableStreamCancel = false;
 	const stream = new ReadableStream({
 		start(controller) {
 			webSocketServer.addEventListener('message', (event) => {
@@ -265,11 +263,12 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
 			});
 
 			webSocketServer.addEventListener('error', (err) => {
-				log('webSocketServer has error' + err);
+				log('webSocketServer has error.' + JSON.stringify(err));
 				controller.error(err);
 			});
-			const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
+			const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader, log);
 			if (error) {
+				log('earlyDataHeader has error.' + JSON.stringify(error));
 				controller.error(error);
 			} else if (earlyData) {
 				controller.enqueue(earlyData);
@@ -283,7 +282,6 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
 
 		cancel(reason) {
 			log(`ReadableStream was canceled, due to ${reason}`)
-			readableStreamCancel = true;
 			safeCloseWebSocket(webSocketServer);
 		}
 	});
@@ -447,7 +445,6 @@ async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, lo
 			},
 			close() {
 				log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
-				// safeCloseWebSocket(webSocket); // no need server close websocket frist for some case will casue HTTP ERR_CONTENT_LENGTH_MISMATCH issue, client will send close event anyway.
 			},
 			abort(reason) {
 				console.error(`remoteConnection!.readable abort`, reason);
@@ -468,7 +465,7 @@ async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, lo
  * @param {string} base64Str The base64 string to decode.
  * @returns {{earlyData: ArrayBuffer|null, error: Error|null}} An object containing the decoded ArrayBuffer or null if there was an error, and any error that occurred during decoding or null if there was no error.
  */
-function base64ToArrayBuffer(base64Str) {
+function base64ToArrayBuffer(base64Str, log) {
 	if (!base64Str) {
 		return { earlyData: null, error: null };
 	}
@@ -477,8 +474,11 @@ function base64ToArrayBuffer(base64Str) {
 		base64Str = base64Str.replace(/-/g, '+').replace(/_/g, '/');
 		const decode = atob(base64Str);
 		const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
+		if(arryBuffer.buffer.byteLength <= 0)
+			return { earlyData: null, error: null };
 		return { earlyData: arryBuffer.buffer, error: null };
 	} catch (error) {
+		log('base64ToArrayBuffer error.' + JSON.stringify(error));
 		return { earlyData: null, error };
 	}
 }
