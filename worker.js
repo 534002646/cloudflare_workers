@@ -189,56 +189,104 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
 	 * @returns {Promise<import("@cloudflare/workers-types").Socket>} A Promise that resolves to the connected socket.
 	 */
 	async function connectAndWrite(address, port) {
-		try{
-			/** @type {import("@cloudflare/workers-types").Socket} */
-			const tcpSocket = connect({
-				hostname: address,
-				port: port,
-			});
-			remoteSocket.value = tcpSocket;
-			log(`connected to ${address}:${port}`);
-			const writer = tcpSocket.writable.getWriter();
-			await writer.write(rawClientData); // first write, nomal is tls client hello
-			writer.releaseLock();
-			return tcpSocket;
-		}catch(error){
-			throw error;
-		}
+		/** @type {import("@cloudflare/workers-types").Socket} */
+		const tcpSocket = connect({
+			hostname: address,
+			port: port,
+		});
+		remoteSocket.value = tcpSocket;
+		log(`connected to ${address}:${port}`);
+		const writer = tcpSocket.writable.getWriter();
+		await writer.write(rawClientData); // first write, nomal is tls client hello
+		writer.releaseLock();
+		return tcpSocket;
 	}
 
 	/**
 	 * Retries connecting to the remote address and port if the Cloudflare socket has no incoming data.
-	 * @param {string} proxyIP The address to connect to.
-	 * @returns { hasIncomingData: boolean} A Promise that resolves when the retry is complete.
+	 * @returns {Promise<void>} A Promise that resolves when the retry is complete.
 	 */
-	async function retry(proxyIP) {
-		try{
-			const tcpSocket = await connectAndWrite(proxyIP, portRemote)
-			tcpSocket.closed.catch(error => {
-				console.log('retry tcpSocket closed error', error);
-			}).finally(() => {
-				safeCloseWebSocket(webSocket);
+	async function retry() {
+		const tcpSocket = await connectAndWrite(proxyIPs[0] || addressRemote, portRemote)
+		tcpSocket.closed.catch(error => {
+			console.log('retry tcpSocket closed error', error);
+		}).finally(() => {
+			safeCloseWebSocket(webSocket);
+		})
+		remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
+	}
+
+	const tcpSocket = await connectAndWrite(addressRemote, portRemote);
+
+	// when remoteSocket is ready, pass to websocket
+	// remote--> ws
+	remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
+}
+
+/**
+ * Converts a remote socket to a WebSocket connection.
+ * @param {import("@cloudflare/workers-types").Socket} remoteSocket The remote socket to convert.
+ * @param {import("@cloudflare/workers-types").WebSocket} webSocket The WebSocket to connect to.
+ * @param {ArrayBuffer | null} vlessResponseHeader The VLESS response header.
+ * @param {(() => Promise<void>) | null} retry The function to retry the connection if it fails.
+ * @param {(info: string) => void} log The logging function.
+ * @returns {Promise<void>} A Promise that resolves when the conversion is complete.
+ */
+async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, retry, log) {
+	// remote--> ws
+	let remoteChunkCount = 0;
+	let chunks = [];
+	/** @type {ArrayBuffer | null} */
+	let vlessHeader = vlessResponseHeader;
+	let hasIncomingData = false; // check if remoteSocket has incoming data
+	await remoteSocket.readable
+		.pipeTo(
+			new WritableStream({
+				start() {
+				},
+				/**
+				 * 
+				 * @param {Uint8Array} chunk 
+				 * @param {*} controller 
+				 */
+				async write(chunk, controller) {
+					hasIncomingData = true;
+					remoteChunkCount++;
+					if (webSocket.readyState !== WS_READY_STATE_OPEN) {
+						controller.error(
+							'webSocket.readyState is not open, maybe close'
+						);
+					}
+					if (vlessHeader) {
+						webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer());
+						vlessHeader = null;
+					} else {
+						webSocket.send(chunk);
+					}
+				},
+				close() {
+					log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
+					// safeCloseWebSocket(webSocket); // no need server close websocket frist for some case will casue HTTP ERR_CONTENT_LENGTH_MISMATCH issue, client will send close event anyway.
+				},
+				abort(reason) {
+					console.error(`remoteConnection!.readable abort`, reason);
+				},
 			})
-			const result = await remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, log);
-			return result;
-		}catch(error){
-			console.log("retry error.", error);
-		}
-		return false;
-	}
-	try{
-		const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-		// when remoteSocket is ready, pass to websocket
-		// remote--> ws
-		const result = await remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, log);
-		if(result) return;
-	}catch(error){
-		console.log("remote -> ws error.", error);
-	}
-	for(let i = 0; i < proxyIPs.length; i++){
-		let ip = proxyIPs[i];
-		let result = await retry(ip);
-		if(result) break;
+		)
+		.catch((error) => {
+			console.error(
+				`remoteSocketToWS has exception `,
+				error.stack || error
+			);
+			safeCloseWebSocket(webSocket);
+		});
+
+	// seems is cf connect socket have error,
+	// 1. Socket.closed will have error
+	// 2. Socket.readable will be close without any data coming
+	if (hasIncomingData === false && retry) {
+		log(`retry`)
+		retry();
 	}
 }
 
@@ -266,7 +314,7 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
 				log('webSocketServer has error.' + JSON.stringify(err));
 				controller.error(err);
 			});
-			const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader, log);
+			const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
 			if (error) {
 				log('earlyDataHeader has error.' + JSON.stringify(error));
 				controller.error(error);
@@ -407,65 +455,12 @@ function processVlessHeader(vlessBuffer) {
 	};
 }
 
-
-/**
- * Converts a remote socket to a WebSocket connection.
- * @param {import("@cloudflare/workers-types").Socket} remoteSocket The remote socket to convert.
- * @param {import("@cloudflare/workers-types").WebSocket} webSocket The WebSocket to connect to.
- * @param {ArrayBuffer | null} vlessResponseHeader The VLESS response header.
- * @param {(info: string) => void} log The logging function.
- * @returns { hasIncomingData: boolean}
- */
-//  @returns {Promise<void>} A Promise that resolves when the conversion is complete.
-async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, log) {
-	// remote--> ws
-	/** @type {ArrayBuffer | null} */
-	let vlessHeader = vlessResponseHeader;
-	let hasIncomingData = false; // check if remoteSocket has incoming data
-	await remoteSocket.readable.pipeTo(new WritableStream({
-			start() {},
-			/**
-			 * 
-			 * @param {Uint8Array} chunk 
-			 * @param {*} controller 
-			 */
-			async write(chunk, controller) {
-				hasIncomingData = true;
-				if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-					controller.error(
-						'webSocket.readyState is not open, maybe close'
-					);
-				}
-				if (vlessHeader) {
-					webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer());
-					vlessHeader = null;
-				} else {
-					webSocket.send(chunk);
-				}
-			},
-			close() {
-				log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
-			},
-			abort(reason) {
-				console.error(`remoteConnection!.readable abort`, reason);
-			},
-		})
-	).catch((error) => {
-		console.error(
-			`remoteSocketToWS has exception `,
-			error.stack || error
-		);
-		safeCloseWebSocket(webSocket);
-	});
-	return hasIncomingData;
-}
-
 /**
  * Decodes a base64 string into an ArrayBuffer.
  * @param {string} base64Str The base64 string to decode.
  * @returns {{earlyData: ArrayBuffer|null, error: Error|null}} An object containing the decoded ArrayBuffer or null if there was an error, and any error that occurred during decoding or null if there was no error.
  */
-function base64ToArrayBuffer(base64Str, log) {
+function base64ToArrayBuffer(base64Str) {
 	if (!base64Str) {
 		return { earlyData: null, error: null };
 	}
@@ -474,11 +469,8 @@ function base64ToArrayBuffer(base64Str, log) {
 		base64Str = base64Str.replace(/-/g, '+').replace(/_/g, '/');
 		const decode = atob(base64Str);
 		const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
-		if(arryBuffer.buffer.byteLength <= 0)
-			return { earlyData: null, error: null };
 		return { earlyData: arryBuffer.buffer, error: null };
 	} catch (error) {
-		log('base64ToArrayBuffer error.' + JSON.stringify(error));
 		return { earlyData: null, error };
 	}
 }
