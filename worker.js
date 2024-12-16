@@ -6,6 +6,11 @@ let proxyIPs; //23.162.136.169
 let dohURL; // https://dns.google/dns-query https://cloudflare-dns.com/dns-query
 // let envl;
 
+// DNS_RESOLVER_URL = https://dns.google/dns-query
+// INDEX = 0
+// PROXYIPS = cdn-all.xn--b6gac.eu.org,cdn-b100.xn--b6gac.eu.org,cdn.xn--b6gac.eu.org,cdn.anycast.eu.org,edgetunnel.anycast.eu.org,bestproxy.onecf.eu.org,workers.cloudflare.cyou
+// UUID = 09abc748-b53f-4ad5-99b8-84576e4854ae
+
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 
@@ -20,9 +25,9 @@ export default {
 		try {
 			const upgradeHeader = request.headers.get('Upgrade');
 			if(upgradeHeader && upgradeHeader == 'websocket'){
-				proxyIPs = env.PROXYIPS.split(',');
 				dohURL = env.DNS_RESOLVER_URL;
-				// envl = env;
+				proxyIPs = env.PROXYIPS;
+				// proxyIP = env.PROXYIPS.split(',')[env.INDEX];
 				return await vlessOverWSHandler(request);
 			}else {
 				const url = new URL(request.url);
@@ -206,21 +211,24 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
 	 * Retries connecting to the remote address and port if the Cloudflare socket has no incoming data.
 	 * @returns {Promise<void>} A Promise that resolves when the retry is complete.
 	 */
-	async function retry() {
-		const tcpSocket = await connectAndWrite(proxyIPs[0] || addressRemote, portRemote)
+	async function retry(index) {
+		if(index >= 5) {
+			return;
+		}
+		const tcpSocket = await connectAndWrite(proxyIPs[index], portRemote);
 		tcpSocket.closed.catch(error => {
 			console.log('retry tcpSocket closed error', error);
 		}).finally(() => {
 			safeCloseWebSocket(webSocket);
 		})
-		remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
+		remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, index, log);
 	}
 
 	const tcpSocket = await connectAndWrite(addressRemote, portRemote);
 
 	// when remoteSocket is ready, pass to websocket
 	// remote--> ws
-	remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
+	remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, 0, log);
 }
 
 /**
@@ -232,7 +240,7 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
  * @param {(info: string) => void} log The logging function.
  * @returns {Promise<void>} A Promise that resolves when the conversion is complete.
  */
-async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, retry, log) {
+async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, retry, index, log) {
 	// remote--> ws
 	let remoteChunkCount = 0;
 	let chunks = [];
@@ -286,7 +294,7 @@ async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, re
 	// 2. Socket.readable will be close without any data coming
 	if (hasIncomingData === false && retry) {
 		log(`retry`)
-		retry();
+		retry(index + 1);
 	}
 }
 
